@@ -1,0 +1,8 @@
+streamlit
+requests
+pandas
+pytz
+c8y-api
+Pillow
+matplotlib
+tkcalendar
