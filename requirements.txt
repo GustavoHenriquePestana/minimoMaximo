@@ -4,6 +4,5 @@ pandas
 pytz
 c8y-api
 Pillow
-matplotlib
-tkcalendar
 plotly
+scipy
