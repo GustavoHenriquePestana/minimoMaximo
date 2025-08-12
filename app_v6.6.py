@@ -515,7 +515,6 @@ def _calculate_predictive_health_index(indicators, measurement_name, current_val
     if 'VEL' in measurement_name:
         limit = limits['v_rms']
     elif 'AC' in measurement_name:
-        # Assumimos que medições de aceleração são RMS para o limite
         limit = limits['a_rms']
 
     if limit is None: return 50
@@ -541,6 +540,20 @@ def _calculate_predictive_health_index(indicators, measurement_name, current_val
     final_score = (severity_score * 0.4) + (degradation_score * 0.6)
 
     return max(0, min(100, final_score))
+
+
+# --- INÍCIO: Nova função para o Status da Tendência ---
+def get_trend_status(health_index):
+    """Retorna uma string formatada para o status da tendência com base no índice de saúde."""
+    if health_index >= 80:
+        return "🟢 Estável"
+    elif 60 <= health_index < 80:
+        return "🟡 Atenção"
+    else:
+        return "🔴 Alerta Crítico"
+
+
+# --- FIM: Nova função ---
 
 
 # --- FUNÇÃO PRINCIPAL REATORADA ---
@@ -602,8 +615,9 @@ def analyze_single_device(job_params, log_queue):
                     trend_indicators = _calculate_trend_indicators(points)
 
                     current_value = series.mean()
-                    trend_indicators['health_index'] = _calculate_predictive_health_index(trend_indicators, target_name,
-                                                                                          current_value)
+                    health_index = _calculate_predictive_health_index(trend_indicators, target_name, current_value)
+                    trend_indicators['health_index'] = health_index
+                    trend_indicators['status'] = get_trend_status(health_index)  # Adiciona o status
                     trend_analysis[target_name] = trend_indicators
 
             operational_kpis = {'is_mkpred': True}
@@ -708,7 +722,7 @@ def save_settings():
     }
     with open("analyzer_settings.json", "w") as f:
         json.dump(settings, f, indent=4)
-    st.toast("Configurações salvas!", icon="�")
+    st.toast("Configurações salvas!", icon="💾")
 
 
 def load_settings():
@@ -928,13 +942,21 @@ else:
                                         for measurement, indicators in trend_data.items():
                                             trend_df_data.append({
                                                 "Medição": measurement,
+                                                "Status da Tendência": indicators.get('status'),
                                                 "Índice de Saúde Preditivo": indicators.get('health_index'),
                                                 "Desvio Padrão": indicators.get('std_dev'),
                                                 "Inclinação da Tendência": indicators.get('slope'),
                                                 "Qualidade da Tendência (R²)": indicators.get('r_squared'),
                                                 "Crescimento (% ao dia)": indicators.get('rate_of_change_day')
                                             })
-                                        trend_df = pd.DataFrame(trend_df_data).set_index("Medição")
+
+                                        trend_df = pd.DataFrame(trend_df_data)
+                                        # Reordenar colunas para ter o Status primeiro
+                                        column_order = ["Medição", "Status da Tendência", "Índice de Saúde Preditivo",
+                                                        "Desvio Padrão", "Inclinação da Tendência",
+                                                        "Qualidade da Tendência (R²)", "Crescimento (% ao dia)"]
+                                        trend_df = trend_df[column_order].set_index("Medição")
+
                                         st.dataframe(trend_df.style.format({
                                             "Índice de Saúde Preditivo": "{:.1f}",
                                             "Desvio Padrão": "{:.4f}",
