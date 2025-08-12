@@ -542,7 +542,6 @@ def _calculate_predictive_health_index(indicators, measurement_name, current_val
     return max(0, min(100, final_score))
 
 
-# --- INÍCIO: Nova função para o Status da Tendência ---
 def get_trend_status(health_index):
     """Retorna uma string formatada para o status da tendência com base no índice de saúde."""
     if health_index >= 80:
@@ -553,7 +552,77 @@ def get_trend_status(health_index):
         return "🔴 Alerta Crítico"
 
 
-# --- FIM: Nova função ---
+def _analisar_assinatura_de_ciclo_completo(raw_data, operational_cycles, job_params, log_queue, device_display_name,
+                                           job_label):
+    """
+    Processa e analisa a assinatura do ciclo de operação completo para medições de carga.
+    Normaliza a duração de cada ciclo para uma escala de 0 a 100 e calcula uma
+    "assinatura" média e o desvio padrão.
+    """
+    cycle_signature_analysis = {}
+    # Pega a primeira medição de carga (ex: 'MA_01') como alvo para a assinatura
+    motor_measurement = next((m for m in job_params.get('load_measurement_names', []) if m.startswith('MA_')), None)
+
+    if not motor_measurement or not operational_cycles:
+        return cycle_signature_analysis
+
+    if motor_measurement in raw_data and raw_data[motor_measurement]:
+        log_queue.put({'type': 'log',
+                       'data': f"[{device_display_name} | {job_label}] Analisando Assinatura de Ciclo Completo para {motor_measurement}..."})
+
+        all_cycle_curves = []
+        df_motor = pd.DataFrame(raw_data[motor_measurement], columns=['time', motor_measurement]).set_index('time')
+
+        for i, cycle in enumerate(operational_cycles):
+            # Filtra os dados do motor para o ciclo atual
+            cycle_df = df_motor[(df_motor.index >= cycle['start']) & (df_motor.index <= cycle['end'])]
+
+            if not cycle_df.empty:
+                cycle_df = cycle_df.copy()
+                cycle_duration = (cycle['end'] - cycle['start']).total_seconds()
+                if cycle_duration == 0: continue
+
+                # Normaliza o tempo do ciclo para uma escala de 0 a 100
+                cycle_df['normalized_time'] = ((cycle_df.index - cycle['start']).total_seconds() / cycle_duration) * 100
+
+                # Guarda a curva original e o ID do ciclo para referência
+                original_curve = cycle_df.set_index('normalized_time')[motor_measurement]
+                all_cycle_curves.append({'id': i, 'curve': original_curve})
+
+        if all_cycle_curves:
+            try:
+                # Cria um índice de tempo normalizado comum (de 0 a 100, com 101 pontos)
+                resample_index = np.linspace(0, 100, 101)
+
+                resampled_curves_dict = {}
+                for cycle_data in all_cycle_curves:
+                    # Interpola cada curva para o novo índice de tempo
+                    # Isso garante que todas as curvas tenham o mesmo "comprimento"
+                    s = cycle_data['curve']
+                    resampled_s = np.interp(resample_index, s.index, s.values)
+                    resampled_curves_dict[f"ciclo_{cycle_data['id']}"] = resampled_s
+
+                # Combina todas as curvas reamostradas em um DataFrame
+                combined_df = pd.DataFrame(resampled_curves_dict, index=resample_index)
+
+                if not combined_df.empty:
+                    # Calcula a média (assinatura dourada) e o desvio padrão
+                    mean_curve = combined_df.mean(axis=1)
+                    std_curve = combined_df.std(axis=1)
+
+                    cycle_signature_analysis[motor_measurement] = {
+                        'mean': mean_curve.to_dict(),
+                        'std': std_curve.to_dict(),
+                        'upper_bound': (mean_curve + std_curve).to_dict(),
+                        'lower_bound': (mean_curve - std_curve).to_dict(),
+                        'curves': {f"ciclo_{cd['id']}": cd['curve'].to_dict() for cd in all_cycle_curves}
+                    }
+            except Exception as e:
+                log_queue.put({'type': 'log',
+                               'data': f"AVISO: Falha ao processar assinatura de ciclo completo para {motor_measurement}. Causa: {e}",
+                               'color': 'warning'})
+
+    return cycle_signature_analysis
 
 
 # --- FUNÇÃO PRINCIPAL REATORADA ---
@@ -593,6 +662,7 @@ def analyze_single_device(job_params, log_queue):
         operational_kpis = {}
         startup_analysis = {}
         trend_analysis = {}
+        cycle_signature_analysis = {}  # Inicializa o novo dicionário
 
         if job_params.get('is_mkpred', False):
             log_queue.put({'type': 'log',
@@ -617,7 +687,7 @@ def analyze_single_device(job_params, log_queue):
                     current_value = series.mean()
                     health_index = _calculate_predictive_health_index(trend_indicators, target_name, current_value)
                     trend_indicators['health_index'] = health_index
-                    trend_indicators['status'] = get_trend_status(health_index)  # Adiciona o status
+                    trend_indicators['status'] = get_trend_status(health_index)
                     trend_analysis[target_name] = trend_indicators
 
             operational_kpis = {'is_mkpred': True}
@@ -636,6 +706,11 @@ def analyze_single_device(job_params, log_queue):
                 results_data = _analisar_dados_nos_ciclos(raw_data, operational_cycles, job_params)
                 startup_analysis = _analisar_assinatura_de_partida(raw_data, operational_cycles, job_params, log_queue,
                                                                    device_display_name, job_label)
+                # Chama a nova função de análise de assinatura de ciclo
+                cycle_signature_analysis = _analisar_assinatura_de_ciclo_completo(raw_data, operational_cycles,
+                                                                                  job_params, log_queue,
+                                                                                  device_display_name, job_label)
+
                 kpis_confiabilidade = _calcular_kpis_de_confiabilidade(operational_cycles, alarms_and_events['alarms'],
                                                                        total_duration, log_queue, device_display_name,
                                                                        job_label)
@@ -660,7 +735,8 @@ def analyze_single_device(job_params, log_queue):
 
         operational_kpis['health_index'] = calculate_health_index(operational_kpis)
 
-        return job_label, device_display_name, results_data, raw_data, api_call_counter, operational_kpis, alarms_and_events, alarm_analysis, startup_analysis, trend_analysis
+        # Retorna o novo dicionário com os resultados
+        return job_label, device_display_name, results_data, raw_data, api_call_counter, operational_kpis, alarms_and_events, alarm_analysis, startup_analysis, trend_analysis, cycle_signature_analysis
 
     except Exception as e:
         import traceback
@@ -668,7 +744,7 @@ def analyze_single_device(job_params, log_queue):
             {'type': 'log',
              'data': f"ERRO FATAL ao analisar {device_display_name} ({job_label}): {e}\n{traceback.format_exc()}",
              'color': 'error'})
-        return job_label, device_display_name, {}, {}, api_call_counter, {}, {}, {}, {}, {}
+        return job_label, device_display_name, {}, {}, api_call_counter, {}, {}, {}, {}, {}, {}
 
 
 def perform_analysis_master_thread(stop_event, log_queue, jobs_to_run):
@@ -680,6 +756,7 @@ def perform_analysis_master_thread(stop_event, log_queue, jobs_to_run):
     final_alarm_analysis = {}
     final_startup_analysis = {}
     final_trend_analysis = {}
+    final_cycle_signature_analysis = {}  # Adiciona o novo dicionário
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_job = {executor.submit(analyze_single_device, job, log_queue): job for job in jobs_to_run}
@@ -689,7 +766,8 @@ def perform_analysis_master_thread(stop_event, log_queue, jobs_to_run):
                 log_queue.put({'type': 'log', 'data': "Cancelamento solicitado pelo usuário.", 'color': 'warning'})
                 break
 
-            job_label, device_name, results, raw, api_calls, kpis, alarms_events, alarm_analysis, startup_analysis, trend_analysis = future.result()
+            # Desempacota o novo valor retornado
+            job_label, device_name, results, raw, api_calls, kpis, alarms_events, alarm_analysis, startup_analysis, trend_analysis, cycle_signature = future.result()
 
             final_results.setdefault(job_label, {})[device_name] = results
             final_raw_data.setdefault(job_label, {})[device_name] = raw
@@ -698,6 +776,8 @@ def perform_analysis_master_thread(stop_event, log_queue, jobs_to_run):
             final_alarm_analysis.setdefault(job_label, {})[device_name] = alarm_analysis
             final_startup_analysis.setdefault(job_label, {})[device_name] = startup_analysis
             final_trend_analysis.setdefault(job_label, {})[device_name] = trend_analysis
+            final_cycle_signature_analysis.setdefault(job_label, {})[
+                device_name] = cycle_signature  # Armazena o novo resultado
 
             total_api_calls += api_calls
             log_queue.put(
@@ -710,7 +790,9 @@ def perform_analysis_master_thread(stop_event, log_queue, jobs_to_run):
                             'kpis': final_kpis, 'alarms_events': final_alarms_events,
                             'alarm_analysis': final_alarm_analysis,
                             'startup_analysis': final_startup_analysis,
-                            'trend_analysis': final_trend_analysis}})
+                            'trend_analysis': final_trend_analysis,
+                            'cycle_signature_analysis': final_cycle_signature_analysis  # Inclui no resultado final
+                            }})
 
 
 # --- Funções para Salvar/Carregar Configurações ---
@@ -749,6 +831,7 @@ if 'alarms_events' not in st.session_state: st.session_state.alarms_events = {}
 if 'alarm_analysis' not in st.session_state: st.session_state.alarm_analysis = {}
 if 'startup_analysis' not in st.session_state: st.session_state.startup_analysis = {}
 if 'trend_analysis' not in st.session_state: st.session_state.trend_analysis = {}
+if 'cycle_signature_analysis' not in st.session_state: st.session_state.cycle_signature_analysis = {}  # Inicializa o novo estado
 if 'analysis_mode' not in st.session_state: st.session_state.analysis_mode = "Análise Detalhada"
 
 # --- Interface Gráfica ---
@@ -784,6 +867,7 @@ if st.session_state.is_running:
             st.session_state.alarm_analysis = msg['data']['alarm_analysis']
             st.session_state.startup_analysis = msg['data']['startup_analysis']
             st.session_state.trend_analysis = msg['data']['trend_analysis']
+            st.session_state.cycle_signature_analysis = msg['data']['cycle_signature_analysis']  # Recebe os novos dados
 
             df_data = []
             for job_label, devices in results_by_job.items():
@@ -935,7 +1019,9 @@ else:
                                                            {'range': [80, 100], 'color': "#28a745"}],
                                                        }))
                                             fig_gauge.update_layout(height=300, margin=dict(l=10, r=10, t=80, b=10))
-                                            st.plotly_chart(fig_gauge, use_container_width=True)
+                                            # CORREÇÃO: Adicionada key única
+                                            st.plotly_chart(fig_gauge, use_container_width=True,
+                                                            key=f"gauge_mkpred_{current_device}")
 
                                         st.subheader("Análise de Tendência")
                                         trend_df_data = []
@@ -951,7 +1037,6 @@ else:
                                             })
 
                                         trend_df = pd.DataFrame(trend_df_data)
-                                        # Reordenar colunas para ter o Status primeiro
                                         column_order = ["Medição", "Status da Tendência", "Índice de Saúde Preditivo",
                                                         "Desvio Padrão", "Inclinação da Tendência",
                                                         "Qualidade da Tendência (R²)", "Crescimento (% ao dia)"]
@@ -987,7 +1072,9 @@ else:
                                                    {'range': [80, 100], 'color': "#28a745"}],
                                                }))
                                     fig_gauge.update_layout(height=300, margin=dict(l=10, r=10, t=80, b=10))
-                                    st.plotly_chart(fig_gauge, use_container_width=True)
+                                    # CORREÇÃO: Adicionada key única
+                                    st.plotly_chart(fig_gauge, use_container_width=True,
+                                                    key=f"gauge_compressor_{current_device}")
 
                                     st.subheader(f"KPIs de Confiabilidade e Operação")
                                     kpi_cols1 = st.columns(3)
@@ -1049,15 +1136,19 @@ else:
                                 valid_measurements = display_df_for_graphs[
                                     display_df_for_graphs['Ocorrências'] > 0].index.tolist()
 
+                                # Define a lista de abas de gráficos
                                 graph_tab_list = ["Série Temporal", "Histograma", "Correlação"]
                                 if not kpis.get('is_mkpred'):
-                                    graph_tab_list.append("Análise de Partida")
+                                    # Adiciona as abas específicas de compressor
+                                    graph_tab_list.extend(["Assinatura de Ciclo", "Análise de Partida"])
                                 if st.session_state.alarm_analysis.get(main_job_label, {}).get(current_device):
                                     graph_tab_list.append("Análise de Alarmes")
 
                                 graph_tabs = st.tabs(graph_tab_list)
+                                tab_idx = 0
 
-                                with graph_tabs[0]:  # Guia Série Temporal
+                                with graph_tabs[tab_idx]:  # Guia Série Temporal
+                                    tab_idx += 1
                                     if valid_measurements:
                                         selected_ts = st.multiselect(
                                             "Selecione as medições para o gráfico de série temporal",
@@ -1116,13 +1207,16 @@ else:
                                             fig_ts.update_layout(title=f'Série Temporal para {current_device}',
                                                                  xaxis_title='Timestamp', yaxis_title='Valor',
                                                                  legend_title='Medições')
-                                            st.plotly_chart(fig_ts, use_container_width=True)
+                                            # CORREÇÃO: Adicionada key única
+                                            st.plotly_chart(fig_ts, use_container_width=True,
+                                                            key=f"ts_chart_{current_device}")
                                         else:
                                             st.info("Selecione pelo menos uma medição para exibir o gráfico.")
                                     else:
                                         st.warning("Nenhuma medição com dados válidos para plotar.")
 
-                                with graph_tabs[1]:  # Guia Histograma
+                                with graph_tabs[tab_idx]:  # Guia Histograma
+                                    tab_idx += 1
                                     if valid_measurements:
                                         selected_hist = st.selectbox("Selecione a medição para o histograma",
                                                                      options=valid_measurements,
@@ -1136,11 +1230,14 @@ else:
                                                 fig_hist.update_layout(
                                                     title=f'Histograma de {selected_hist} para {current_device}',
                                                     xaxis_title='Valor', yaxis_title='Frequência')
-                                                st.plotly_chart(fig_hist, use_container_width=True)
+                                                # CORREÇÃO: Adicionada key única
+                                                st.plotly_chart(fig_hist, use_container_width=True,
+                                                                key=f"hist_chart_{current_device}")
                                     else:
                                         st.warning("Nenhuma medição com dados válidos para plotar.")
 
-                                with graph_tabs[2]:  # Guia Correlação
+                                with graph_tabs[tab_idx]:  # Guia Correlação
+                                    tab_idx += 1
                                     if len(valid_measurements) >= 2:
                                         col1, col2 = st.columns(2)
                                         with col1:
@@ -1165,18 +1262,91 @@ else:
                                                 df_corr = pd.concat([df_x, df_y], axis=1).interpolate(
                                                     method='time').dropna()
 
-                                                correlation_coef = df_corr[x_axis_corr].corr(df_corr[y_axis_corr])
+                                                if not df_corr.empty:
+                                                    correlation_coef = df_corr[x_axis_corr].corr(df_corr[y_axis_corr])
 
-                                                fig_corr = go.Figure(
-                                                    data=go.Scatter(x=df_corr[x_axis_corr], y=df_corr[y_axis_corr],
-                                                                    mode='markers'))
-                                                fig_corr.update_layout(
-                                                    title=f'Correlação entre {x_axis_corr} e {y_axis_corr}<br>Coeficiente de Pearson: {correlation_coef:.2f}',
-                                                    xaxis_title=x_axis_corr, yaxis_title=y_axis_corr)
-                                                st.plotly_chart(fig_corr, use_container_width=True)
+                                                    fig_corr = go.Figure(
+                                                        data=go.Scatter(x=df_corr[x_axis_corr], y=df_corr[y_axis_corr],
+                                                                        mode='markers'))
+                                                    fig_corr.update_layout(
+                                                        title=f'Correlação entre {x_axis_corr} e {y_axis_corr}<br>Coeficiente de Pearson: {correlation_coef:.2f}',
+                                                        xaxis_title=x_axis_corr, yaxis_title=y_axis_corr)
+                                                    # CORREÇÃO: Adicionada key única
+                                                    st.plotly_chart(fig_corr, use_container_width=True,
+                                                                    key=f"corr_chart_{current_device}")
+                                                else:
+                                                    st.warning("Não foi possível alinhar os dados para a correlação.")
                                     else:
                                         st.warning(
                                             "São necessárias pelo menos duas medições com dados para a análise de correlação.")
+
+                                # NOVA ABA: Assinatura de Ciclo
+                                if "Assinatura de Ciclo" in graph_tab_list:
+                                    with graph_tabs[tab_idx]:
+                                        tab_idx += 1
+                                        st.subheader("Análise da Assinatura do Ciclo de Operação")
+
+                                        cycle_analysis_data = st.session_state.cycle_signature_analysis.get(
+                                            main_job_label, {}).get(current_device, {})
+
+                                        if not cycle_analysis_data:
+                                            st.warning(
+                                                "Não há dados de assinatura de ciclo para este dispositivo. Verifique se uma medição de carga (ex: MA_01) foi selecionada.")
+                                        else:
+                                            motor_measurement = next(iter(cycle_analysis_data))
+                                            analysis = cycle_analysis_data[motor_measurement]
+
+                                            fig_sig = go.Figure()
+
+                                            x_axis = list(analysis['mean'].keys())
+                                            mean_curve = list(analysis['mean'].values())
+                                            upper_bound = list(analysis['upper_bound'].values())
+                                            lower_bound = list(analysis['lower_bound'].values())
+
+                                            fig_sig.add_trace(go.Scatter(
+                                                x=x_axis + x_axis[::-1],
+                                                y=upper_bound + lower_bound[::-1],
+                                                fill='toself',
+                                                fillcolor='rgba(0,100,80,0.2)',
+                                                line=dict(color='rgba(255,255,255,0)'),
+                                                hoverinfo="skip",
+                                                name='Faixa de Normalidade (±1σ)'
+                                            ))
+
+                                            fig_sig.add_trace(go.Scatter(
+                                                x=x_axis, y=mean_curve,
+                                                line=dict(color='rgb(0,100,80)'),
+                                                mode='lines',
+                                                name='Assinatura Média'
+                                            ))
+
+                                            all_cycle_ids = list(analysis['curves'].keys())
+                                            selected_cycles = st.multiselect(
+                                                "Selecione ciclos individuais para comparar:",
+                                                options=all_cycle_ids,
+                                                default=[],
+                                                key=f"cycle_select_{current_device}"
+                                            )
+
+                                            for cycle_id in selected_cycles:
+                                                curve_data = analysis['curves'][cycle_id]
+                                                fig_sig.add_trace(go.Scatter(
+                                                    x=list(curve_data.keys()),
+                                                    y=list(curve_data.values()),
+                                                    mode='lines',
+                                                    line=dict(width=1, dash='dot'),
+                                                    name=f'Ciclo {cycle_id.split("_")[-1]}'
+                                                ))
+
+                                            fig_sig.update_layout(
+                                                title=f'Assinatura de Ciclo para {motor_measurement}',
+                                                xaxis_title='Progresso do Ciclo (%)',
+                                                yaxis_title='Valor da Medição',
+                                                legend_title='Legenda'
+                                            )
+                                            # CORREÇÃO: Adicionada key única
+                                            st.plotly_chart(fig_sig, use_container_width=True,
+                                                            key=f"sig_chart_{current_device}")
 
     st.divider()
 
